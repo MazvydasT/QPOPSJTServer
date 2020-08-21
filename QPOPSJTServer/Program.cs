@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -20,7 +21,7 @@ namespace QPOPSJTServer
 
     class Message
     {
-        public long Id { get; set; }
+        public int Id { get; set; }
         public Command Command { get; set; }
         public string Data { get; set; }
         public string Error { get; set; }
@@ -53,45 +54,50 @@ namespace QPOPSJTServer
         {
             Debug.WriteLine("Waiting for client");
 
-            server.AcceptWebSocketAsync(new CancellationToken()).ContinueWith(task =>
+            server.AcceptWebSocketAsync(CancellationToken.None).ContinueWith(task =>
             {
-                Debug.WriteLine("Client received");
-
                 WaitForClient(server);
 
-                WaitForMessage(task.Result);
+                var client = task.Result;
+
+                Debug.WriteLine($"Client received {client.RemoteEndpoint}");
+
+                Context context = new Context()
+                {
+                    Client = client
+                };
+
+                WaitForMessage(context);
             });
         }
 
-        static void WaitForMessage(WebSocket client)
+        static void WaitForMessage(Context context)
         {
             Debug.WriteLine("Waiting for message");
 
-            client.ReadStringAsync(new CancellationToken()).ContinueWith(task =>
+            var client = context.Client;
+
+            client.ReadStringAsync(CancellationToken.None).ContinueWith(task =>
             {
                 if (!client.IsConnected)
                 {
-                    Debug.WriteLine("Client disconnected");
+                    Debug.WriteLine($"Client disconnected {client.RemoteEndpoint}");
                     return;
                 }
 
-                Debug.WriteLine("Message received");
+                var message = JsonConvert.DeserializeObject<Message>(task.Result);
 
-                WaitForMessage(client);
+                Debug.WriteLine($"Message received {message.Id}");
 
-                ProcessMessage(task.Result, client);
+                WaitForMessage(context);
+                
+                ProcessMessage(message, context);
             });
         }
 
-        static void ProcessMessage(string messageText, WebSocket client)
+        static void ProcessMessage(Message message, Context context)
         {
-            var message = JsonConvert.DeserializeObject<Message>(messageText);
-
-            var context = new Context()
-            {
-                Client = client,
-                RequestMessage = message
-            };
+            context.RequestMessage = message;
 
             switch (message.Command.Name)
             {
@@ -155,7 +161,10 @@ namespace QPOPSJTServer
 
                 process.WaitForExit();
 
-                Send(Convert.ToBase64String(File.ReadAllBytes(jtFile)), context);
+                using(var fileStream = File.OpenRead(jtFile))
+                {
+                    Send(fileStream, context);
+                }
             }
 
             catch (Exception e)
@@ -178,20 +187,40 @@ namespace QPOPSJTServer
             }
         }
 
+        static void Send(Stream dataStream, Context context, bool errorMessage = false)
+        {
+            var idByteArray = BitConverter.GetBytes(context.RequestMessage.Id);
+            if (!BitConverter.IsLittleEndian)
+                Array.Reverse(idByteArray);
+
+            var isError = (byte)(errorMessage ? 1 : 0);
+
+            lock (context.Client)
+            {
+                using (var messageWriterStream = context.Client.CreateMessageWriter(WebSocketMessageType.Binary))
+                {
+                    messageWriterStream.Write(idByteArray, 0, 4);
+                    messageWriterStream.Write(new byte[] { isError }, 0, 1);
+                    dataStream.CopyTo(messageWriterStream);
+                }
+            }
+
+            Debug.WriteLine($"Message sent {context.RequestMessage.Id}");
+        }
+
+
+        static void Send(byte[] data, Context context, bool errorMessage = false)
+        {
+            using (var memoryStream = new MemoryStream(data))
+            {
+                Send(memoryStream, context, errorMessage);
+            }
+        }
+
+        private static Encoding utf8EncodingWithoutBOM = new UTF8Encoding(false);
         static void Send(string data, Context context, bool errorMessage = false)
         {
-            var message = new Message()
-            {
-                Id = context.RequestMessage.Id
-            };
-
-            if (errorMessage)
-                message.Error = data;
-
-            else
-                message.Data = data;
-
-            context.Client.WriteString(JsonConvert.SerializeObject(message));
+            Send(utf8EncodingWithoutBOM.GetBytes(data), context, errorMessage);
         }
 
         static void HandleError(string errorMessage, Context context)
